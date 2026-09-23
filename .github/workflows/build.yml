@@ -2,11 +2,13 @@ name: TachiyomiSY AutoBuild
 
 on:
   schedule:
-    # Nightly - every day 04:00 Taiwan / 20:00 UTC previous day
-    - cron: "0 20 * * *"
+    # Nightly - every day 04:00 Taiwan time
+    - cron: "0 4 * * *"
+      timezone: "Asia/Taipei"
 
-    # Weekly - every Monday 07:00 Taiwan / Sunday 23:00 UTC
-    - cron: "0 23 * * 0"
+    # Weekly - every Monday 07:00 Taiwan time
+    - cron: "0 7 * * 1"
+      timezone: "Asia/Taipei"
 
   workflow_dispatch:
     inputs:
@@ -35,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '0 20 * * 0' && 'weekly' || 'nightly') }}
+      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '0 7 * * 1' && 'weekly' || 'nightly') }}
 
     steps:
 
@@ -77,24 +79,37 @@ jobs:
           echo "[3/5] Finding latest $CHANNEL release marker"
 
           asset_url="$(
-            jq -r --arg prefix "${CHANNEL}-" '
-              (
-                [
-                  .[]
-                  | select(
-                      (.tag_name // "")
-                      | startswith($prefix)
-                    )
-                ]
-                | sort_by(.created_at // "")
-                | last
-              ) as $release
-              |
-              ($release.assets // [])[]
-              | select(.name == "upstream-commit.txt")
-              | .browser_download_url
-              // empty
-            ' releases.json
+            python3 -c '
+          import json
+          import sys
+
+          channel = sys.argv[1]
+          data = json.load(open("releases.json", encoding="utf-8"))
+
+          prefix = channel + "-"
+
+          releases = [
+              release
+              for release in data
+              if str(release.get("tag_name", "")).startswith(prefix)
+          ]
+
+          releases.sort(
+              key=lambda release: release.get("created_at") or ""
+          )
+
+          if not releases:
+              sys.exit(0)
+
+          release = releases[-1]
+
+          for asset in release.get("assets") or []:
+              if asset.get("name") == "upstream-commit.txt":
+                  url = asset.get("browser_download_url")
+                  if url:
+                      print(url)
+                  break
+          ' "$CHANNEL"
           )"
 
           previous_sha=""
@@ -108,7 +123,7 @@ jobs:
                 --max-time 30 \
                 "$asset_url" \
                 | tr -d '[:space:]'
-            )
+            )"
 
             if [ -z "$previous_sha" ]; then
               echo "::warning::upstream-commit.txt was empty"
@@ -230,10 +245,6 @@ jobs:
           p = Path("app/build.gradle.kts")
           s = p.read_text()
 
-          # ----------------------------------------------------------
-          # Disable Google Services / Crashlytics
-          # ----------------------------------------------------------
-
           marker = 'if (gradle.startParameter.taskRequests.toString().contains("Release")) {'
 
           start = s.find(marker)
@@ -256,20 +267,12 @@ jobs:
               + s[end + 3:]
           )
 
-          # ----------------------------------------------------------
-          # Remove Firebase dependencies
-          # ----------------------------------------------------------
-
           for dep in (
               "    implementation(platform(libs.firebase.bom))\n",
               "    implementation(libs.firebase.analytics)\n",
               "    implementation(libs.firebase.crashlytics)\n",
           ):
               s = s.replace(dep, "", 1)
-
-          # ----------------------------------------------------------
-          # Fixed Android versionCode
-          # ----------------------------------------------------------
 
           s, replaced = re.subn(
               r'        versionCode = \d+',
@@ -282,10 +285,6 @@ jobs:
               raise SystemExit(
                   "versionCode declaration not found"
               )
-
-          # ----------------------------------------------------------
-          # AutoBuild versionName
-          # ----------------------------------------------------------
 
           s, replaced = re.subn(
               r'        versionName = ".*?"',
