@@ -2,11 +2,11 @@ name: TachiyomiSY AutoBuild
 
 on:
   schedule:
-    # Nightly - every day 03:17 UTC / 11:17 Taiwan
-    - cron: "17 3 * * *"
+    # Nightly - every day 04:00 Taiwan / 20:00 UTC previous day
+    - cron: "0 20 * * *"
 
-    # Weekly - every Monday 03:23 UTC / 11:23 Taiwan
-    - cron: "23 3 * * 1"
+    # Weekly - every Monday 04:00 Taiwan / Sunday 20:00 UTC
+    - cron: "0 20 * * 0"
 
   workflow_dispatch:
     inputs:
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '23 3 * * 1' && 'weekly' || 'nightly') }}
+      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '0 20 * * 0' && 'weekly' || 'nightly') }}
 
     steps:
       # ============================================================
@@ -76,15 +76,36 @@ jobs:
           echo "[3/5] Finding latest $CHANNEL release marker"
 
           asset_url="$(
-            jq -r --arg prefix "$CHANNEL-" '
-              map(select(.tag_name | startswith($prefix)))
-              | sort_by(.created_at)
-              | last
-              | .assets[]?
-              | select(.name == "upstream-commit.txt")
-              | .browser_download_url
-            ' releases.json \
-            | head -n1
+            python3 - "$CHANNEL" releases.json <<'PY'
+          import json
+          import sys
+
+          channel = sys.argv[1]
+          filename = sys.argv[2]
+
+          with open(filename, "r", encoding="utf-8") as f:
+              releases = json.load(f)
+
+          prefix = channel + "-"
+
+          matched = [
+              release
+              for release in releases
+              if str(release.get("tag_name", "")).startswith(prefix)
+          ]
+
+          matched.sort(
+              key=lambda release: release.get("created_at", "")
+          )
+
+          if matched:
+              latest = matched[-1]
+
+              for asset in latest.get("assets", []):
+                  if asset.get("name") == "upstream-commit.txt":
+                      print(asset.get("browser_download_url", ""))
+                      break
+          PY
           )"
 
           previous_sha=""
@@ -140,7 +161,7 @@ jobs:
           echo "app_version=$APP_VERSION_NAME" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # Checkout
+      # Checkout upstream
       # ============================================================
 
       - name: Checkout upstream
@@ -254,17 +275,16 @@ jobs:
               s = s.replace(dep, "", 1)
 
           # ----------------------------------------------------------
-          # AutoBuild versionName
+          # Fixed Android versionCode
           #
-          # versionCode is intentionally fixed. This allows Weekly
-          # and Nightly builds to replace each other and allows
-          # going back to an older timestamp build.
+          # versionName carries the actual AutoBuild version.
+          # Keeping versionCode constant allows the updater to
+          # switch between Weekly / Nightly builds and go backwards
+          # by versionName.
           # ----------------------------------------------------------
 
-          version_code_pattern = r'        versionCode = \d+'
-
           s, replaced = re.subn(
-              version_code_pattern,
+              r'        versionCode = \d+',
               "        versionCode = 1000000",
               s,
               count=1,
@@ -274,6 +294,10 @@ jobs:
               raise SystemExit(
                   "versionCode declaration not found"
               )
+
+          # ----------------------------------------------------------
+          # AutoBuild versionName
+          # ----------------------------------------------------------
 
           s, replaced = re.subn(
               r'        versionName = ".*?"',
@@ -489,18 +513,6 @@ jobs:
 
           # ==========================================================
           # AppUpdateChecker
-          #
-          # The updater now uses:
-          #
-          #   LANqed/TachiyomiSY-AutoBuild#weekly
-          #   LANqed/TachiyomiSY-AutoBuild#nightly
-          #
-          # Version comparison is exact string comparison.
-          # This intentionally allows:
-          #
-          #   newer -> older
-          #   weekly -> nightly
-          #   nightly -> weekly
           # ==========================================================
 
           Path(
@@ -593,10 +605,10 @@ jobs:
               ): Release {
 
                   val channel =
-                      repository.substringAfter('#', "weekly")
+                      repository.substringAfter("#", "weekly")
 
                   val repo =
-                      repository.substringBefore('#')
+                      repository.substringBefore("#")
 
                   return with(json) {
                       networkService.client
@@ -622,8 +634,6 @@ jobs:
 
           # ==========================================================
           # GetApplicationRelease
-          #
-          # Weekly and Nightly have independent check intervals.
           # ==========================================================
 
           p = Path(
@@ -706,8 +716,10 @@ jobs:
               1,
           )
 
-          # Replace the original numerical / semver comparison with
-          # exact version-name comparison.
+          # ----------------------------------------------------------
+          # Replace version comparison
+          # ----------------------------------------------------------
+
           old_function_pattern = (
               r'    // SY -->\n'
               r'    private fun isNewVersion\(\n'
@@ -728,7 +740,9 @@ jobs:
                   versionName: String,
                   versionTag: String,
               ): Boolean {
-                  // AutoBuild deliberately compares exact version strings.
+                  // AutoBuild compares the complete version string.
+                  //
+                  // Only an identical version means "already up to date".
                   //
                   // This allows:
                   //   weekly -> newer weekly
@@ -736,9 +750,6 @@ jobs:
                   //   weekly -> nightly
                   //   nightly -> weekly
                   //   nightly -> older nightly
-                  //
-                  // Only an identical version string is considered
-                  // already up to date.
                   return versionTag != versionName
               }
               // SY <--"""
@@ -753,8 +764,7 @@ jobs:
 
           if replaced != 1:
               raise SystemExit(
-                  "GetApplicationRelease version comparison "
-                  "function not found"
+                  "GetApplicationRelease version comparison function not found"
               )
 
           p.write_text(s)
@@ -839,10 +849,11 @@ jobs:
                   1,
               )
           )
+
           PY
 
       # ============================================================
-      # Changelog
+      # Generate changelog
       # ============================================================
 
       - name: Generate changelog
@@ -983,7 +994,7 @@ jobs:
           ./gradlew assembleRelease --stacktrace
 
       # ============================================================
-      # Decode JKS
+      # Decode keystore
       # ============================================================
 
       - name: Decode keystore
