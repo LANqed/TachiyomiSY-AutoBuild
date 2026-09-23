@@ -2,11 +2,11 @@ name: TachiyomiSY AutoBuild
 
 on:
   schedule:
-    # Nightly - every day 04:00 Taiwan / 20:00 UTC previous day
+    # Nightly - every day 04:00 Taiwan UTC+8 / 20:00 UTC previous day
     - cron: "0 20 * * *"
 
-    # Weekly - every Monday 04:00 Taiwan / Sunday 20:00 UTC
-    - cron: "0 20 * * 0"
+    # Weekly - every Monday 07:00 Taiwan UTC+8 / Sunday 01:00 UTC
+    - cron: "0 1 * * 0"
 
   workflow_dispatch:
     inputs:
@@ -75,8 +75,9 @@ jobs:
 
           echo "[3/5] Finding latest $CHANNEL release marker"
 
-          asset_url="$(
-            python3 - "$CHANNEL" releases.json <<'PY'
+          rm -f asset_url.txt
+
+          python3 - "$CHANNEL" releases.json > asset_url.txt <<'PY'
           import json
           import sys
 
@@ -103,10 +104,13 @@ jobs:
 
               for asset in latest.get("assets", []):
                   if asset.get("name") == "upstream-commit.txt":
-                      print(asset.get("browser_download_url", ""))
+                      url = asset.get("browser_download_url", "")
+                      if url:
+                          print(url)
                       break
           PY
-          )"
+
+          asset_url="$(tr -d '\r\n' < asset_url.txt)"
 
           previous_sha=""
 
@@ -277,10 +281,7 @@ jobs:
           # ----------------------------------------------------------
           # Fixed Android versionCode
           #
-          # versionName carries the actual AutoBuild version.
-          # Keeping versionCode constant allows the updater to
-          # switch between Weekly / Nightly builds and go backwards
-          # by versionName.
+          # versionName carries the real AutoBuild version.
           # ----------------------------------------------------------
 
           s, replaced = re.subn(
@@ -869,24 +870,12 @@ jobs:
           if [ -n "$PREVIOUS_SHA" ]; then
             gh api \
               "repos/$UPSTREAM_REPO/compare/$PREVIOUS_SHA...$CURRENT_SHA" \
-              --jq '.commits[] |
-                [
-                  .sha,
-                  (.commit.message | split("\n")[0]),
-                  (.author.login // .commit.author.name)
-                ] |
-                @tsv' \
+              --jq '.commits[] | [.sha, (.commit.message | split("\n")[0]), (.author.login // .commit.author.name)] | @tsv' \
               > commits.tsv
           else
             gh api \
               "repos/$UPSTREAM_REPO/commits?sha=$UPSTREAM_BRANCH&per_page=20" \
-              --jq '.[] |
-                [
-                  .sha,
-                  (.commit.message | split("\n")[0]),
-                  (.author.login // .commit.author.name)
-                ] |
-                @tsv' \
+              --jq '.[] | [.sha, (.commit.message | split("\n")[0]), (.author.login // .commit.author.name)] | @tsv' \
               > commits.tsv
           fi
 
