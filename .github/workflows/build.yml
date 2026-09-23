@@ -2,8 +2,12 @@ name: TachiyomiSY AutoBuild
 
 on:
   schedule:
+    # Nightly - every day 03:17 UTC / 11:17 Taiwan
     - cron: "17 3 * * *"
+
+    # Weekly - every Monday 03:23 UTC / 11:23 Taiwan
     - cron: "23 3 * * 1"
+
   workflow_dispatch:
     inputs:
       channel:
@@ -11,7 +15,7 @@ on:
         required: true
         type: choice
         options:
-          - dev
+          - weekly
           - nightly
 
 permissions:
@@ -29,10 +33,15 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     env:
-      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '23 3 * * 1' && 'dev' || 'nightly') }}
+      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '23 3 * * 1' && 'weekly' || 'nightly') }}
 
     steps:
+      # ============================================================
+      # Check upstream
+      # ============================================================
+
       - name: Check upstream
         id: upstream
         env:
@@ -41,6 +50,7 @@ jobs:
           set -euo pipefail
 
           echo "[1/5] Checking upstream branch: $UPSTREAM_REPO#$UPSTREAM_BRANCH"
+
           current_sha="$(
             curl -fsSL \
               --connect-timeout 10 \
@@ -50,38 +60,51 @@ jobs:
               "https://api.github.com/repos/$UPSTREAM_REPO/git/ref/heads/$UPSTREAM_BRANCH" \
               | jq -r '.object.sha'
           )"
+
           test -n "$current_sha"
           test "$current_sha" != "null"
+
           echo "Current upstream SHA: $current_sha"
 
           echo "[2/5] Reading existing $CHANNEL releases"
-          timeout 30s gh api "repos/$RELEASE_REPO/releases?per_page=100" > releases.json
+
+          timeout 30s \
+            gh api \
+            "repos/$RELEASE_REPO/releases?per_page=100" \
+            > releases.json
 
           echo "[3/5] Finding latest $CHANNEL release marker"
-          asset_url="$(jq -r --arg prefix "$CHANNEL-" '
-            map(select(.tag_name | startswith($prefix)))
-            | sort_by(.created_at)
-            | last
-            | .assets[]?
-            | select(.name == "upstream-commit.txt")
-            | .browser_download_url
-          ' releases.json | head -n1)"
+
+          asset_url="$(
+            jq -r --arg prefix "$CHANNEL-" '
+              map(select(.tag_name | startswith($prefix)))
+              | sort_by(.created_at)
+              | last
+              | .assets[]?
+              | select(.name == "upstream-commit.txt")
+              | .browser_download_url
+            ' releases.json \
+            | head -n1
+          )"
 
           previous_sha=""
+
           if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
             echo "[4/5] Downloading previous upstream SHA"
+
             previous_sha="$(
               curl -fsSL \
                 --connect-timeout 10 \
                 --max-time 30 \
                 "$asset_url" \
                 | tr -d '[:space:]'
-            )"
+            )
           else
             echo "[4/5] No previous $CHANNEL build found"
           fi
 
           echo "Previous upstream SHA: ${previous_sha:-<none>}"
+
           echo "current_sha=$current_sha" >> "$GITHUB_OUTPUT"
           echo "previous_sha=$previous_sha" >> "$GITHUB_OUTPUT"
 
@@ -93,6 +116,33 @@ jobs:
             echo "[5/5] Upstream changed; continuing to build"
           fi
 
+      # ============================================================
+      # Generate build version
+      # ============================================================
+
+      - name: Set build version
+        if: steps.upstream.outputs.changed == 'true'
+        id: version
+        run: |
+          set -euo pipefail
+
+          BUILD_NUMBER="$(TZ=Asia/Taipei date '+%Y%m%d%H%M%S')"
+          APP_VERSION_NAME="${CHANNEL}-${BUILD_NUMBER}"
+
+          echo "Build channel: $CHANNEL"
+          echo "Build number: $BUILD_NUMBER"
+          echo "APP version: $APP_VERSION_NAME"
+
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION_NAME=$APP_VERSION_NAME" >> "$GITHUB_ENV"
+
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Checkout
+      # ============================================================
+
       - name: Checkout upstream
         if: steps.upstream.outputs.changed == 'true'
         uses: actions/checkout@v4
@@ -100,6 +150,10 @@ jobs:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ env.UPSTREAM_BRANCH }}
           fetch-depth: 0
+
+      # ============================================================
+      # Java / Gradle / Android SDK
+      # ============================================================
 
       - name: Set up JDK
         if: steps.upstream.outputs.changed == 'true'
@@ -116,7 +170,13 @@ jobs:
         if: steps.upstream.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "build-tools;29.0.3"
+
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "build-tools;29.0.3"
+
+      # ============================================================
+      # Signing secrets
+      # ============================================================
 
       - name: Validate signing secrets
         if: steps.upstream.outputs.changed == 'true'
@@ -126,14 +186,19 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
           test -n "$KEYSTORE_BASE64"
           test -n "$KEYSTORE_PASSWORD"
           test -n "$KEY_PASSWORD"
 
+      # ============================================================
+      # Patch upstream source
+      # ============================================================
+
       - name: Patch updater
         if: steps.upstream.outputs.changed == 'true'
         env:
-          RUN_NUMBER: ${{ github.run_number }}
+          APP_VERSION_NAME: ${{ steps.version.outputs.app_version }}
         run: |
           set -euo pipefail
 
@@ -142,17 +207,44 @@ jobs:
           import os
           import re
 
+          APP_VERSION_NAME = os.environ["APP_VERSION_NAME"]
+
+          # ==========================================================
+          # app/build.gradle.kts
+          # ==========================================================
+
           p = Path("app/build.gradle.kts")
           s = p.read_text()
 
+          # ----------------------------------------------------------
+          # Disable Google Services / Crashlytics
+          # ----------------------------------------------------------
+
           marker = 'if (gradle.startParameter.taskRequests.toString().contains("Release")) {'
+
           start = s.find(marker)
+
           if start < 0:
-              raise SystemExit("Google Services plugin block not found")
+              raise SystemExit(
+                  "Google Services plugin block not found"
+              )
+
           end = s.find("\n}\n", start)
+
           if end < 0:
-              raise SystemExit("Google Services plugin block end not found")
-          s = s[:start] + "// AutoBuild: Google Services / Crashlytics disabled.\\n" + s[end + 3:]
+              raise SystemExit(
+                  "Google Services plugin block end not found"
+              )
+
+          s = (
+              s[:start]
+              + "// AutoBuild: Google Services / Crashlytics disabled.\n"
+              + s[end + 3:]
+          )
+
+          # ----------------------------------------------------------
+          # Remove Firebase dependencies
+          # ----------------------------------------------------------
 
           for dep in (
               "    implementation(platform(libs.firebase.bom))\n",
@@ -160,30 +252,92 @@ jobs:
               "    implementation(libs.firebase.crashlytics)\n",
           ):
               s = s.replace(dep, "", 1)
+
+          # ----------------------------------------------------------
+          # AutoBuild versionName
+          #
+          # versionCode is intentionally fixed. This allows Weekly
+          # and Nightly builds to replace each other and allows
+          # going back to an older timestamp build.
+          # ----------------------------------------------------------
+
+          version_code_pattern = r'        versionCode = \d+'
+
+          s, replaced = re.subn(
+              version_code_pattern,
+              "        versionCode = 1000000",
+              s,
+              count=1,
+          )
+
+          if replaced != 1:
+              raise SystemExit(
+                  "versionCode declaration not found"
+              )
+
+          s, replaced = re.subn(
+              r'        versionName = ".*?"',
+              f'        versionName = System.getenv("APP_VERSION_NAME") ?: "{APP_VERSION_NAME}"',
+              s,
+              count=1,
+          )
+
+          if replaced != 1:
+              raise SystemExit(
+                  "versionName declaration not found"
+              )
+
           p.write_text(s)
 
-          # FlexibleAdapter: JitPack no longer serves the old arkon/c8013533
-          # artifact. Use the Maven Central release instead.
+          # ==========================================================
+          # FlexibleAdapter
+          # ==========================================================
+
           p = Path("gradle/libs.versions.toml")
           s = p.read_text()
+
           if 'flexibleAdapter = "c8013533"' not in s:
-              raise SystemExit("FlexibleAdapter version c8013533 not found")
+              raise SystemExit(
+                  "FlexibleAdapter version c8013533 not found"
+              )
+
           s = s.replace(
               'flexibleAdapter = "c8013533"',
               'flexibleAdapter = "5.1.0"',
               1,
           )
-          old_module = 'com.github.arkon.FlexibleAdapter:flexible-adapter'
-          new_module = 'eu.davidea:flexible-adapter'
+
+          old_module = (
+              "com.github.arkon.FlexibleAdapter:flexible-adapter"
+          )
+
+          new_module = (
+              "eu.davidea:flexible-adapter"
+          )
+
           if old_module not in s:
-              raise SystemExit("FlexibleAdapter Maven coordinate not found")
-          s = s.replace(old_module, new_module, 1)
+              raise SystemExit(
+                  "FlexibleAdapter Maven coordinate not found"
+              )
+
+          s = s.replace(
+              old_module,
+              new_module,
+              1,
+          )
+
           p.write_text(s)
 
-          # Remove the upstream Firebase Analytics startup call. Without
-          # google-services.json, Firebase.analytics would crash the app at launch.
-          main = Path("app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt")
+          # ==========================================================
+          # MainActivity
+          # ==========================================================
+
+          main = Path(
+              "app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt"
+          )
+
           s = main.read_text()
+
           for line in (
               "import com.google.firebase.Firebase\n",
               "import com.google.firebase.analytics.analytics\n",
@@ -192,30 +346,68 @@ jobs:
           ):
               s = s.replace(line, "")
 
-          pattern = r'    private fun addAnalytics\(\) \{\n        if \(\!BuildConfig\.DEBUG && isPreviewBuildType\) \{\n            Firebase\.analytics\.setUserProperty\(\"preview_version\", syDebugVersion\)\n        \}\n    \}'
-          s, replaced = re.subn(pattern, "    private fun addAnalytics() {}", s, count=1)
+          pattern = (
+              r'    private fun addAnalytics\(\) \{\n'
+              r'        if \(\!BuildConfig\.DEBUG && isPreviewBuildType\) \{\n'
+              r'            Firebase\.analytics\.setUserProperty\('
+              r'"preview_version", syDebugVersion\)\n'
+              r'        \}\n'
+              r'    \}'
+          )
+
+          s, replaced = re.subn(
+              pattern,
+              "    private fun addAnalytics() {}",
+              s,
+              count=1,
+          )
+
           if replaced != 1:
-              raise SystemExit("MainActivity Firebase analytics block not found")
+              raise SystemExit(
+                  "MainActivity Firebase analytics block not found"
+              )
+
           main.write_text(s)
 
-          # Keep the upstream Firebase call sites source-compatible, but replace
-          # the implementations with no-op versions because this build has no
-          # google-services.json and intentionally does not bundle Firebase.
-          crashlytics = Path("app/src/main/java/exh/log/CrashlyticsPrinter.kt")
+          # ==========================================================
+          # Crashlytics no-op
+          # ==========================================================
+
+          crashlytics = Path(
+              "app/src/main/java/exh/log/CrashlyticsPrinter.kt"
+          )
+
           crashlytics.write_text(
           """package exh.log
 
           import com.elvishew.xlog.printer.Printer
 
           /** No-op implementation for AutoBuild builds without Firebase. */
-          class CrashlyticsPrinter(private val logLevel: Int) : Printer {
-              override fun println(logLevel: Int, tag: String?, msg: String?) = Unit
+          class CrashlyticsPrinter(
+              private val logLevel: Int,
+          ) : Printer {
+              override fun println(
+                  logLevel: Int,
+                  tag: String?,
+                  msg: String?,
+              ) = Unit
           }
           """
           )
 
-          firebase_config = Path("app/src/release/java/mihon/core/firebase/FirebaseConfig.kt")
-          firebase_config.parent.mkdir(parents=True, exist_ok=True)
+          # ==========================================================
+          # FirebaseConfig no-op
+          # ==========================================================
+
+          firebase_config = Path(
+              "app/src/release/java/mihon/core/firebase/FirebaseConfig.kt"
+          )
+
+          firebase_config.parent.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
           firebase_config.write_text(
           """package mihon.core.firebase
 
@@ -224,15 +416,28 @@ jobs:
           /** No-op implementation for AutoBuild builds without Firebase. */
           object FirebaseConfig {
               fun init(context: Context) = Unit
-              fun setAnalyticsEnabled(enabled: Boolean) = Unit
-              fun setCrashlyticsEnabled(enabled: Boolean) = Unit
+
+              fun setAnalyticsEnabled(
+                  enabled: Boolean,
+              ) = Unit
+
+              fun setCrashlyticsEnabled(
+                  enabled: Boolean,
+              ) = Unit
           }
           """
           )
 
-          # Remove Firebase-only manifest entries.
-          manifest = Path("app/src/main/AndroidManifest.xml")
+          # ==========================================================
+          # AndroidManifest Firebase removal
+          # ==========================================================
+
+          manifest = Path(
+              "app/src/main/AndroidManifest.xml"
+          )
+
           s = manifest.read_text()
+
           for block in (
               """    <!-- Remove unnecessary permissions from Firebase dependency -->
               <uses-permission
@@ -268,13 +473,39 @@ jobs:
               """,
           ):
               s = s.replace(block, "")
+
           manifest.write_text(s)
 
-          Path("app/src/main/java/exh/Version.kt").write_text(
-              "package exh\n\nconst val syDebugVersion: String = \"" + os.environ["RUN_NUMBER"] + "\"\n"
+          # ==========================================================
+          # AutoBuild version
+          # ==========================================================
+
+          Path(
+              "app/src/main/java/exh/Version.kt"
+          ).write_text(
+              "package exh\n\n"
+              f'const val syDebugVersion: String = "{APP_VERSION_NAME}"\n'
           )
 
-          Path("app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt").write_text(
+          # ==========================================================
+          # AppUpdateChecker
+          #
+          # The updater now uses:
+          #
+          #   LANqed/TachiyomiSY-AutoBuild#weekly
+          #   LANqed/TachiyomiSY-AutoBuild#nightly
+          #
+          # Version comparison is exact string comparison.
+          # This intentionally allows:
+          #
+          #   newer -> older
+          #   weekly -> nightly
+          #   nightly -> weekly
+          # ==========================================================
+
+          Path(
+              "app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt"
+          ).write_text(
           """package eu.kanade.tachiyomi.data.updater
 
           import android.content.Context
@@ -286,29 +517,43 @@ jobs:
           import uy.kohesive.injekt.injectLazy
 
           class AppUpdateChecker {
-              private val getApplicationRelease: GetApplicationRelease by injectLazy()
-              private val basePreferences: BasePreferences by injectLazy()
+
+              private val getApplicationRelease:
+                  GetApplicationRelease by injectLazy()
+
+              private val basePreferences:
+                  BasePreferences by injectLazy()
 
               suspend fun checkForUpdate(
                   context: Context,
                   forceCheck: Boolean = false,
               ): GetApplicationRelease.Result = withIOContext {
+
                   val channel = basePreferences.updateChannel.get()
+
+                  val lastChannel =
+                      basePreferences.lastUpdateCheckChannel.get()
+
+                  val channelChanged =
+                      lastChannel != channel
+
                   val result = getApplicationRelease.await(
                       GetApplicationRelease.Arguments(
-                          // AutoBuild releases use numeric channel build tags.
                           true,
                           BuildConfig.COMMIT_COUNT.toInt(),
                           BuildConfig.VERSION_NAME,
                           "$GITHUB_REPO#$channel",
                           syDebugVersion,
-                          forceCheck,
+                          forceCheck || channelChanged,
                       ),
                   )
+
+                  basePreferences.lastUpdateCheckChannel.set(channel)
 
                   when (result) {
                       is GetApplicationRelease.Result.NewUpdate ->
                           AppUpdateNotifier(context).promptUpdate(result.release)
+
                       else -> Unit
                   }
 
@@ -316,11 +561,18 @@ jobs:
               }
           }
 
-          const val GITHUB_REPO: String = "LANqed/TachiyomiSY-AutoBuild"
+          const val GITHUB_REPO =
+              "LANqed/TachiyomiSY-AutoBuild"
           """
           )
 
-          Path("data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt").write_text(
+          # ==========================================================
+          # ReleaseServiceImpl
+          # ==========================================================
+
+          Path(
+              "data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt"
+          ).write_text(
           """package tachiyomi.data.release
 
           import eu.kanade.tachiyomi.network.GET
@@ -335,101 +587,263 @@ jobs:
               private val networkService: NetworkHelper,
               private val json: Json,
           ) : ReleaseService {
-              override suspend fun latest(repository: String): Release {
-                  val channel = repository.substringAfter('#', "dev")
-                  val repo = repository.substringBefore('#')
+
+              override suspend fun latest(
+                  repository: String,
+              ): Release {
+
+                  val channel =
+                      repository.substringAfter('#', "weekly")
+
+                  val repo =
+                      repository.substringBefore('#')
 
                   return with(json) {
                       networkService.client
-                          .newCall(GET("https://api.github.com/repos/$repo/releases?per_page=100"))
+                          .newCall(
+                              GET(
+                                  "https://api.github.com/repos/$repo/releases?per_page=100"
+                              )
+                          )
                           .awaitSuccess()
                           .parseAs<List<GithubRelease>>()
-                          .first { it.version.startsWith("$channel-") }
-                          .let(releaseMapper)
+                          .firstOrNull {
+                              it.version.startsWith("$channel-")
+                          }
+                          ?.let(releaseMapper)
+                          ?: error(
+                              "No $channel release found in $repo"
+                          )
                   }
               }
           }
           """
           )
 
-          p = Path("domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt")
+          # ==========================================================
+          # GetApplicationRelease
+          #
+          # Weekly and Nightly have independent check intervals.
+          # ==========================================================
+
+          p = Path(
+              "domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt"
+          )
+
           s = p.read_text()
-          
+
           old_pref = (
               '    private val lastChecked: Preference<Long> by lazy {\n'
-              '        preferenceStore.getLong(Preference.appStateKey("last_app_check"), 0)\n'
+              '        preferenceStore.getLong('
+              'Preference.appStateKey("last_app_check"), 0)\n'
               '    }\n'
               '\n'
           )
+
           if old_pref not in s:
-              raise SystemExit("GetApplicationRelease lastChecked block not found")
-          s = s.replace(old_pref, "", 1)
-          
+              raise SystemExit(
+                  "GetApplicationRelease lastChecked block not found"
+              )
+
+          s = s.replace(
+              old_pref,
+              "",
+              1,
+          )
+
           old = (
               "        val now = Instant.now()\n"
               "\n"
               "        // Limit checks to once every 3 days at most\n"
-              "        val nextCheckTime = Instant.ofEpochMilli(lastChecked.get()).plus(3, ChronoUnit.DAYS)\n"
+              "        val nextCheckTime = "
+              "Instant.ofEpochMilli(lastChecked.get()).plus(3, ChronoUnit.DAYS)\n"
               "        if (!arguments.forceCheck && now.isBefore(nextCheckTime)) {\n"
               "            return Result.NoNewUpdate\n"
               "        }\n"
               "\n"
-              "        val release = service.latest(arguments.repository)\n"
+              "        val release = "
+              "service.latest(arguments.repository)\n"
               "\n"
               "        lastChecked.set(now.toEpochMilli())"
           )
+
           new = (
               "        val now = Instant.now()\n"
-              "        val channel = arguments.repository.substringAfter('#', \"default\")\n"
+              "\n"
+              "        val channel = "
+              'arguments.repository.substringAfter("#", "weekly")\n'
+              "\n"
               "        val lastChecked = preferenceStore.getLong(\n"
-              "            Preference.appStateKey(\"last_app_check_$channel\"),\n"
+              '            Preference.appStateKey("last_app_check_$channel"),\n'
               "            0,\n"
               "        )\n"
               "\n"
-              "        val checkIntervalDays = if (channel == \"nightly\") 1L else 7L\n"
-              "        val nextCheckTime = Instant.ofEpochMilli(lastChecked.get())\n"
+              '        val checkIntervalDays = if (channel == "nightly") 1L else 7L\n'
+              "\n"
+              "        val nextCheckTime = "
+              "Instant.ofEpochMilli(lastChecked.get())\n"
               "            .plus(checkIntervalDays, ChronoUnit.DAYS)\n"
-              "        if (!arguments.forceCheck && now.isBefore(nextCheckTime)) {\n"
+              "\n"
+              "        if (!arguments.forceCheck && "
+              "now.isBefore(nextCheckTime)) {\n"
               "            return Result.NoNewUpdate\n"
               "        }\n"
               "\n"
-              "        val release = service.latest(arguments.repository)\n"
+              "        val release = "
+              "service.latest(arguments.repository)\n"
               "\n"
               "        lastChecked.set(now.toEpochMilli())"
           )
+
           if old not in s:
-              raise SystemExit("GetApplicationRelease check block not found")
-          p.write_text(s.replace(old, new, 1))
-          p = Path("app/src/main/java/eu/kanade/domain/base/BasePreferences.kt")
-          s = p.read_text()
-          marker = '    val installationId: Preference<String> = preferenceStore.getString(Preference.appStateKey("installation_id"), "")'
-          addition = '''    val updateChannel: Preference<String> = preferenceStore.getString(
-              Preference.appStateKey("update_channel"),
-              "dev",
+              raise SystemExit(
+                  "GetApplicationRelease check block not found"
+              )
+
+          s = s.replace(
+              old,
+              new,
+              1,
           )
 
-          ''' + marker
-          if marker not in s:
-              raise SystemExit("BasePreferences insertion point not found")
-          p.write_text(s.replace(marker, addition, 1))
+          # Replace the original numerical / semver comparison with
+          # exact version-name comparison.
+          old_function_pattern = (
+              r'    // SY -->\n'
+              r'    private fun isNewVersion\(\n'
+              r'        isPreview: Boolean,\n'
+              r'        syDebugVersion: String,\n'
+              r'        versionName: String,\n'
+              r'        versionTag: String,\n'
+              r'    \): Boolean \{\n'
+              r'.*?\n'
+              r'    \}\n'
+              r'    // SY <--'
+          )
 
-          p = Path("app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt")
+          new_function = """    // SY -->
+              private fun isNewVersion(
+                  isPreview: Boolean,
+                  syDebugVersion: String,
+                  versionName: String,
+                  versionTag: String,
+              ): Boolean {
+                  // AutoBuild deliberately compares exact version strings.
+                  //
+                  // This allows:
+                  //   weekly -> newer weekly
+                  //   weekly -> older weekly
+                  //   weekly -> nightly
+                  //   nightly -> weekly
+                  //   nightly -> older nightly
+                  //
+                  // Only an identical version string is considered
+                  // already up to date.
+                  return versionTag != versionName
+              }
+              // SY <--"""
+
+          s, replaced = re.subn(
+              old_function_pattern,
+              new_function,
+              s,
+              count=1,
+              flags=re.S,
+          )
+
+          if replaced != 1:
+              raise SystemExit(
+                  "GetApplicationRelease version comparison "
+                  "function not found"
+              )
+
+          p.write_text(s)
+
+          # ==========================================================
+          # BasePreferences
+          # ==========================================================
+
+          p = Path(
+              "app/src/main/java/eu/kanade/domain/base/BasePreferences.kt"
+          )
+
           s = p.read_text()
+
+          marker = (
+              '    val installationId: Preference<String> = '
+              'preferenceStore.getString('
+              'Preference.appStateKey("installation_id"), "")'
+          )
+
+          addition = """    val updateChannel: Preference<String> =
+              preferenceStore.getString(
+                  Preference.appStateKey("update_channel"),
+                  "weekly",
+              )
+
+          val lastUpdateCheckChannel: Preference<String> =
+              preferenceStore.getString(
+                  Preference.appStateKey("last_update_check_channel"),
+                  "",
+              )
+
+          """ + marker
+
+          if marker not in s:
+              raise SystemExit(
+                  "BasePreferences insertion point not found"
+              )
+
+          p.write_text(
+              s.replace(
+                  marker,
+                  addition,
+                  1,
+              )
+          )
+
+          # ==========================================================
+          # SettingsAdvancedScreen
+          # ==========================================================
+
+          p = Path(
+              "app/src/main/java/"
+              "eu/kanade/presentation/more/settings/screen/"
+              "SettingsAdvancedScreen.kt"
+          )
+
+          s = p.read_text()
+
           marker = "        return listOf(\n"
-          addition = '''        return listOf(
+
+          addition = """        return listOf(
               Preference.PreferenceItem.ListPreference(
                   preference = basePreferences.updateChannel,
                   entries = mapOf(
-                      "dev" to "Dev (7 days)",
+                      "weekly" to "Weekly (7 days)",
                       "nightly" to "Nightly (24 hours)",
                   ),
                   title = "Update channel",
               ),
-          '''
+          """
+
           if marker not in s:
-              raise SystemExit("SettingsAdvancedScreen return list not found")
-          p.write_text(s.replace(marker, addition, 1))
+              raise SystemExit(
+                  "SettingsAdvancedScreen return list not found"
+              )
+
+          p.write_text(
+              s.replace(
+                  marker,
+                  addition,
+                  1,
+              )
+          )
           PY
+
+      # ============================================================
+      # Changelog
+      # ============================================================
 
       - name: Generate changelog
         if: steps.upstream.outputs.changed == 'true'
@@ -437,16 +851,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CURRENT_SHA: ${{ steps.upstream.outputs.current_sha }}
           PREVIOUS_SHA: ${{ steps.upstream.outputs.previous_sha }}
-          RUN_NUMBER: ${{ github.run_number }}
+          APP_VERSION_NAME: ${{ steps.version.outputs.app_version }}
         run: |
           set -euo pipefail
 
           if [ -n "$PREVIOUS_SHA" ]; then
-            gh api "repos/$UPSTREAM_REPO/compare/$PREVIOUS_SHA...$CURRENT_SHA" \
-              --jq '.commits[] | [.sha, (.commit.message | split("\n")[0]), (.author.login // .commit.author.name)] | @tsv' > commits.tsv
+            gh api \
+              "repos/$UPSTREAM_REPO/compare/$PREVIOUS_SHA...$CURRENT_SHA" \
+              --jq '.commits[] |
+                [
+                  .sha,
+                  (.commit.message | split("\n")[0]),
+                  (.author.login // .commit.author.name)
+                ] |
+                @tsv' \
+              > commits.tsv
           else
-            gh api "repos/$UPSTREAM_REPO/commits?sha=$UPSTREAM_BRANCH&per_page=20" \
-              --jq '.[] | [.sha, (.commit.message | split("\n")[0]), (.author.login // .commit.author.name)] | @tsv' > commits.tsv
+            gh api \
+              "repos/$UPSTREAM_REPO/commits?sha=$UPSTREAM_BRANCH&per_page=20" \
+              --jq '.[] |
+                [
+                  .sha,
+                  (.commit.message | split("\n")[0]),
+                  (.author.login // .commit.author.name)
+                ] |
+                @tsv' \
+              > commits.tsv
           fi
 
           python3 - <<'PY'
@@ -456,27 +886,63 @@ jobs:
           import os
 
           channel = os.environ["CHANNEL"]
-          run_number = os.environ["RUN_NUMBER"]
+          app_version = os.environ["APP_VERSION_NAME"]
+
           lines = Path("commits.tsv").read_text().splitlines()
+
           if not lines:
-              lines = ["0000000\tInitial build\tunknown"]
+              lines = [
+                  "0000000\tInitial build\tunknown"
+              ]
 
           out = [
               '<?xml version="1.0" encoding="utf-8"?>',
               '<changelog bulletedList="true">',
-              f'    <changelogversion changeDate="{datetime.now(timezone.utc):%Y-%m-%d}" versionName="{channel}-r{run_number}">',
+              (
+                  '    <changelogversion '
+                  f'changeDate="{datetime.now(timezone.utc):%Y-%m-%d}" '
+                  f'versionName="{escape(app_version)}">'
+              ),
           ]
+
           for line in lines:
               parts = line.split("\t", 2)
-              message = parts[1] if len(parts) > 1 else "Update"
-              author = parts[2] if len(parts) > 2 else "unknown"
-              out.append(f"        <changelogtext>{escape(message)} (@{escape(author)})</changelogtext>")
-          out += ["    </changelogversion>", "</changelog>", ""]
-          Path("app/src/main/res/raw/changelog_debug.xml").write_text("\n".join(out))
+
+              message = (
+                  parts[1]
+                  if len(parts) > 1
+                  else "Update"
+              )
+
+              author = (
+                  parts[2]
+                  if len(parts) > 2
+                  else "unknown"
+              )
+
+              out.append(
+                  "        "
+                  f"<changelogtext>{escape(message)} "
+                  f"(@{escape(author)})</changelogtext>"
+              )
+
+          out += [
+              "    </changelogversion>",
+              "</changelog>",
+              "",
+          ]
+
+          Path(
+              "app/src/main/res/raw/changelog_debug.xml"
+          ).write_text(
+              "\n".join(out)
+          )
           PY
 
           {
-            echo "## TachiyomiSY $CHANNEL Build $RUN_NUMBER"
+            echo "## TachiyomiSY $CHANNEL"
+            echo
+            echo "**Version:** \`$APP_VERSION_NAME\`"
             echo
             echo "**Upstream:** $UPSTREAM_REPO"
             echo
@@ -486,29 +952,56 @@ jobs:
             echo
             echo "### Changelog"
             echo
+
             while IFS=$'\t' read -r sha message author; do
               [ -n "$message" ] || continue
-              echo "- $message (@$author)"
+
+              if [ -n "$author" ]; then
+                echo "- $message (@$author)"
+              else
+                echo "- $message"
+              fi
             done < commits.tsv
+
             echo
-            if [ "$CHANNEL" = "dev" ]; then
-              echo "Channel: Dev (weekly)"
+            if [ "$CHANNEL" = "weekly" ]; then
+              echo "Channel: Weekly"
+              echo "Update interval: 7 days"
             else
-              echo "Channel: Nightly (daily)"
+              echo "Channel: Nightly"
+              echo "Update interval: 24 hours"
             fi
           } > release_notes.md
 
+      # ============================================================
+      # Build
+      # ============================================================
+
       - name: Build
         if: steps.upstream.outputs.changed == 'true'
-        run: ./gradlew assembleRelease --stacktrace
+        run: |
+          ./gradlew assembleRelease --stacktrace
+
+      # ============================================================
+      # Decode JKS
+      # ============================================================
 
       - name: Decode keystore
         if: steps.upstream.outputs.changed == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > signing.jks
+          set -euo pipefail
+
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode \
+            > signing.jks
+
           test -s signing.jks
+
+      # ============================================================
+      # Detect JKS alias
+      # ============================================================
 
       - name: Detect alias
         if: steps.upstream.outputs.changed == 'true'
@@ -517,9 +1010,24 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
-          alias="$(keytool -list -v -keystore signing.jks -storepass "$KEYSTORE_PASSWORD" 2>/dev/null | awk -F': ' '/^Alias name:/{print $2; exit}')"
+
+          alias="$(
+            keytool \
+              -list \
+              -v \
+              -keystore signing.jks \
+              -storepass "$KEYSTORE_PASSWORD" \
+              2>/dev/null \
+              | awk -F': ' '/^Alias name:/{print $2; exit}'
+          )"
+
           test -n "$alias"
+
           echo "alias=$alias" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Sign APKs
+      # ============================================================
 
       - name: Sign APKs
         if: steps.upstream.outputs.changed == 'true'
@@ -531,61 +1039,128 @@ jobs:
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
+      # ============================================================
+      # Prepare release files
+      # ============================================================
+
       - name: Prepare release
         if: steps.upstream.outputs.changed == 'true'
         env:
-          RUN_NUMBER: ${{ github.run_number }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
           CURRENT_SHA: ${{ steps.upstream.outputs.current_sha }}
         run: |
           set -euo pipefail
+
           cd app/build/outputs/apk/release
 
-          universal="$(find . -maxdepth 1 -type f -name '*universal*unsigned-signed.apk' | head -n1)"
-          arm64="$(find . -maxdepth 1 -type f -name '*arm64-v8a*unsigned-signed.apk' | head -n1)"
-          arm32="$(find . -maxdepth 1 -type f -name '*armeabi-v7a*unsigned-signed.apk' | head -n1)"
-          x86="$(find . -maxdepth 1 -type f -name '*x86-release-unsigned-signed.apk' | head -n1)"
-          x86_64="$(find . -maxdepth 1 -type f -name '*x86_64*unsigned-signed.apk' | head -n1)"
+          universal="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*universal*unsigned-signed.apk' \
+              | head -n1
+          )"
 
-          for apk in "$universal" "$arm64" "$arm32" "$x86" "$x86_64"; do
-            test -n "$apk" || { echo "::error::Signed APK set incomplete"; exit 1; }
+          arm64="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*arm64-v8a*unsigned-signed.apk' \
+              | head -n1
+          )"
+
+          arm32="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*armeabi-v7a*unsigned-signed.apk' \
+              | head -n1
+          )"
+
+          x86="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*x86-release-unsigned-signed.apk' \
+              | head -n1
+          )"
+
+          x86_64="$(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*x86_64*unsigned-signed.apk' \
+              | head -n1
+          )"
+
+          for apk in \
+            "$universal" \
+            "$arm64" \
+            "$arm32" \
+            "$x86" \
+            "$x86_64"
+          do
+            test -n "$apk" || {
+              echo "::error::Signed APK set incomplete"
+              exit 1
+            }
           done
 
-          # Keep the architecture marker immediately after TachiyomiSY so the updater can match it.
-          mv "$universal" "$GITHUB_WORKSPACE/TachiyomiSY-universal-$CHANNEL-$RUN_NUMBER.apk"
-          mv "$arm64" "$GITHUB_WORKSPACE/TachiyomiSY-arm64-v8a-$CHANNEL-$RUN_NUMBER.apk"
-          mv "$arm32" "$GITHUB_WORKSPACE/TachiyomiSY-armeabi-v7a-$CHANNEL-$RUN_NUMBER.apk"
-          mv "$x86" "$GITHUB_WORKSPACE/TachiyomiSY-x86-$CHANNEL-$RUN_NUMBER.apk"
-          mv "$x86_64" "$GITHUB_WORKSPACE/TachiyomiSY-x86_64-$CHANNEL-$RUN_NUMBER.apk"
+          mv "$universal" \
+            "$GITHUB_WORKSPACE/TachiyomiSY-universal-$CHANNEL-$BUILD_NUMBER.apk"
+
+          mv "$arm64" \
+            "$GITHUB_WORKSPACE/TachiyomiSY-arm64-v8a-$CHANNEL-$BUILD_NUMBER.apk"
+
+          mv "$arm32" \
+            "$GITHUB_WORKSPACE/TachiyomiSY-armeabi-v7a-$CHANNEL-$BUILD_NUMBER.apk"
+
+          mv "$x86" \
+            "$GITHUB_WORKSPACE/TachiyomiSY-x86-$CHANNEL-$BUILD_NUMBER.apk"
+
+          mv "$x86_64" \
+            "$GITHUB_WORKSPACE/TachiyomiSY-x86_64-$CHANNEL-$BUILD_NUMBER.apk"
 
           cd "$GITHUB_WORKSPACE"
-          printf '%s\n' "$CURRENT_SHA" > upstream-commit.txt
-          printf '%s\n' "$CHANNEL" > channel.txt
+
+          printf '%s\n' "$CURRENT_SHA" \
+            > upstream-commit.txt
+
+          printf '%s\n' "$CHANNEL" \
+            > channel.txt
 
           sha256sum \
-            "TachiyomiSY-universal-$CHANNEL-$RUN_NUMBER.apk" \
-            "TachiyomiSY-arm64-v8a-$CHANNEL-$RUN_NUMBER.apk" \
-            "TachiyomiSY-armeabi-v7a-$CHANNEL-$RUN_NUMBER.apk" \
-            "TachiyomiSY-x86-$CHANNEL-$RUN_NUMBER.apk" \
-            "TachiyomiSY-x86_64-$CHANNEL-$RUN_NUMBER.apk" \
+            "TachiyomiSY-universal-$CHANNEL-$BUILD_NUMBER.apk" \
+            "TachiyomiSY-arm64-v8a-$CHANNEL-$BUILD_NUMBER.apk" \
+            "TachiyomiSY-armeabi-v7a-$CHANNEL-$BUILD_NUMBER.apk" \
+            "TachiyomiSY-x86-$CHANNEL-$BUILD_NUMBER.apk" \
+            "TachiyomiSY-x86_64-$CHANNEL-$BUILD_NUMBER.apk" \
             > SHA256SUMS.txt
+
+      # ============================================================
+      # GitHub Release
+      # ============================================================
 
       - name: Release
         if: steps.upstream.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.CHANNEL }}-${{ github.run_number }}
-          name: TachiyomiSY ${{ env.CHANNEL }} Build ${{ github.run_number }}
+          tag_name: ${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}
+          name: TachiyomiSY ${{ env.CHANNEL }} ${{ steps.version.outputs.build_number }}
           body_path: release_notes.md
+
           files: |
-            TachiyomiSY-universal-${{ env.CHANNEL }}-${{ github.run_number }}.apk
-            TachiyomiSY-arm64-v8a-${{ env.CHANNEL }}-${{ github.run_number }}.apk
-            TachiyomiSY-armeabi-v7a-${{ env.CHANNEL }}-${{ github.run_number }}.apk
-            TachiyomiSY-x86-${{ env.CHANNEL }}-${{ github.run_number }}.apk
-            TachiyomiSY-x86_64-${{ env.CHANNEL }}-${{ github.run_number }}.apk
+            TachiyomiSY-universal-${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}.apk
+            TachiyomiSY-arm64-v8a-${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}.apk
+            TachiyomiSY-armeabi-v7a-${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}.apk
+            TachiyomiSY-x86-${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}.apk
+            TachiyomiSY-x86_64-${{ env.CHANNEL }}-${{ steps.version.outputs.build_number }}.apk
             upstream-commit.txt
             channel.txt
             SHA256SUMS.txt
+
           draft: false
           prerelease: false
+
         env:
           GITHUB_TOKEN: ${{ github.token }}
