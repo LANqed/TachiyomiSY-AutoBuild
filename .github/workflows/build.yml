@@ -5,8 +5,8 @@ on:
     # Nightly - every day 04:00 Taiwan / 20:00 UTC previous day
     - cron: "0 20 * * *"
 
-    # Weekly - every Monday 04:00 Taiwan / Sunday 20:00 UTC
-    - cron: "0 20 * * 0"
+    # Weekly - every Monday 07:00 Taiwan / Sunday 23:00 UTC
+    - cron: "0 23 * * 0"
 
   workflow_dispatch:
     inputs:
