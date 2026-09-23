@@ -78,16 +78,19 @@ jobs:
 
           asset_url="$(
             jq -r --arg prefix "${CHANNEL}-" '
-              [
-                .[]
-                | select(
-                    (.tag_name // "")
-                    | startswith($prefix)
-                  )
-              ]
-              | sort_by(.created_at // "")
-              | last
-              | .assets[]
+              (
+                [
+                  .[]
+                  | select(
+                      (.tag_name // "")
+                      | startswith($prefix)
+                    )
+                ]
+                | sort_by(.created_at // "")
+                | last
+              ) as $release
+              |
+              ($release.assets // [])[]
               | select(.name == "upstream-commit.txt")
               | .browser_download_url
               // empty
@@ -106,6 +109,10 @@ jobs:
                 "$asset_url" \
                 | tr -d '[:space:]'
             )
+
+            if [ -z "$previous_sha" ]; then
+              echo "::warning::upstream-commit.txt was empty"
+            fi
           else
             echo "[4/5] No previous $CHANNEL build found"
           fi
