@@ -2,11 +2,11 @@ name: TachiyomiSY AutoBuild
 
 on:
   schedule:
-    # Nightly - every day 04:00 Taiwan UTC+8 / 20:00 UTC previous day
+    # Nightly - every day 04:00 Taiwan / 20:00 UTC previous day
     - cron: "0 20 * * *"
 
-    # Weekly - every Monday 07:00 Taiwan UTC+8 / Sunday 01:00 UTC
-    - cron: "0 1 * * 0"
+    # Weekly - every Monday 04:00 Taiwan / Sunday 20:00 UTC
+    - cron: "0 20 * * 0"
 
   workflow_dispatch:
     inputs:
@@ -38,6 +38,7 @@ jobs:
       CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || (github.event.schedule == '0 20 * * 0' && 'weekly' || 'nightly') }}
 
     steps:
+
       # ============================================================
       # Check upstream
       # ============================================================
@@ -75,46 +76,27 @@ jobs:
 
           echo "[3/5] Finding latest $CHANNEL release marker"
 
-          rm -f asset_url.txt
-
-          python3 - "$CHANNEL" releases.json > asset_url.txt <<'PY'
-          import json
-          import sys
-
-          channel = sys.argv[1]
-          filename = sys.argv[2]
-
-          with open(filename, "r", encoding="utf-8") as f:
-              releases = json.load(f)
-
-          prefix = channel + "-"
-
-          matched = [
-              release
-              for release in releases
-              if str(release.get("tag_name", "")).startswith(prefix)
-          ]
-
-          matched.sort(
-              key=lambda release: release.get("created_at", "")
-          )
-
-          if matched:
-              latest = matched[-1]
-
-              for asset in latest.get("assets", []):
-                  if asset.get("name") == "upstream-commit.txt":
-                      url = asset.get("browser_download_url", "")
-                      if url:
-                          print(url)
-                      break
-          PY
-
-          asset_url="$(tr -d '\r\n' < asset_url.txt)"
+          asset_url="$(
+            jq -r --arg prefix "${CHANNEL}-" '
+              [
+                .[]
+                | select(
+                    (.tag_name // "")
+                    | startswith($prefix)
+                  )
+              ]
+              | sort_by(.created_at // "")
+              | last
+              | .assets[]
+              | select(.name == "upstream-commit.txt")
+              | .browser_download_url
+              // empty
+            ' releases.json
+          )"
 
           previous_sha=""
 
-          if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
+          if [ -n "$asset_url" ]; then
             echo "[4/5] Downloading previous upstream SHA"
 
             previous_sha="$(
@@ -280,8 +262,6 @@ jobs:
 
           # ----------------------------------------------------------
           # Fixed Android versionCode
-          #
-          # versionName carries the real AutoBuild version.
           # ----------------------------------------------------------
 
           s, replaced = re.subn(
